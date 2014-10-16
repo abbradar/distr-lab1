@@ -2,9 +2,8 @@
     TemplateHaskell, OverloadedStrings, RecordWildCards, ScopedTypeVariables #-}
 
 import Data.Monoid ((<>))
-import Control.Monad (when, unless)
+import Control.Monad (when, unless, liftM)
 import Data.Maybe (fromJust)
-import Control.Applicative ((<$>))
 import Yesod hiding (get)
 import System.Environment (getEnv)
 import Data.Text (Text)
@@ -69,30 +68,32 @@ getPrivateR = do
     return (c, s)
   -- Check state
   when (state /= fromJust (reqToken req)) $ fail "Invalid state; please don't try to hack us!"
-  -- Call Github back
-  auth' <- liftIO $ postWith (defaults & header "Accept" .~ ["application/json"])
-           "https://github.com/login/oauth/access_token"
-           [ "client_id" := clientId
-           , "client_secret" := clientSecret
-           , "code" := code
-           , "redirect_uri" := url <> "/private"
-           ]
-  -- Decode JSON and scopes
-  auth@AuthResponse { accessToken } <- maybe (fail "Invalid auth response") return $ decode $ auth' ^. responseBody
+  -- Call Github back and decode response
+  let dec err p = maybe (fail err) return $ decode $ p ^. responseBody
+  auth@AuthResponse { accessToken } <-
+    liftIO (postWith (defaults & header "Accept" .~ ["application/json"])
+            "https://github.com/login/oauth/access_token"
+            [ "client_id" := clientId
+            , "client_secret" := clientSecret
+            , "code" := code
+            , "redirect_uri" := url <> "/private"
+            ])
+    >>= dec "Invalid auth response"
   let scopes = T.splitOn "," $ scope auth
   -- Check access rights
   unless ("user" `elem` scopes) $ fail "Unsufficient access rights"
   -- Get user emails
-  mails' <- liftIO $ getWith (defaults & param "access_token" .~ [accessToken])
-            "https://api.github.com/user/emails"
-  (mails :: [EmailResponse]) <- maybe (fail "Invalid emails response") return $ decode $ mails' ^. responseBody
+  (mails :: [EmailResponse]) <-
+    liftIO (getWith (defaults & param "access_token" .~ [accessToken]) "https://api.github.com/user/emails")
+    >>= dec "Invalid emails response"
   -- Show them
   defaultLayout [whamlet| Your emails: #{show mails} |]
 
 main :: IO ()
 main = do
-  clientId <- T.pack <$> getEnv "CLIENT_ID"
-  clientSecret <- T.pack <$> getEnv "CLIENT_SECRET"
-  url <- T.pack <$> getEnv "APP_URL"
+  let genv = liftM T.pack . getEnv
+  clientId <- genv "CLIENT_ID"
+  clientSecret <- genv "CLIENT_SECRET"
+  url <- genv "APP_URL"
   -- Start server with the environment.
   warp 3000 Project { .. }
