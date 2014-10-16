@@ -1,12 +1,11 @@
-{-# LANGUAGE TypeFamilies, QuasiQuotes, MultiParamTypeClasses,
-             TemplateHaskell, OverloadedStrings, RecordWildCards #-}
+{-# LANGUAGE TypeFamilies, QuasiQuotes, MultiParamTypeClasses, NamedFieldPuns,
+    TemplateHaskell, OverloadedStrings, RecordWildCards, ScopedTypeVariables #-}
 
 import Data.Monoid ((<>))
-import Control.Monad (join, when)
-import Data.List (lookup)
+import Control.Monad (when, unless)
 import Data.Maybe (fromJust)
 import Control.Applicative ((<$>))
-import Yesod
+import Yesod hiding (get)
 import System.Environment (getEnv)
 import Data.Text (Text)
 import qualified Data.Text as T
@@ -26,13 +25,21 @@ instance Yesod Project where
   -- Get app URL from environment.
   approot = ApprootMaster url
 
-data GithubResponse = GithubResponse { accessToken :: Text
-                                     , scope :: [Text]
-                                     , tokenType :: Text
-                                     }
-                      deriving (Show)
+data AuthResponse = AuthResponse { accessToken :: Text
+                                 , scope :: Text
+                                 , tokenType :: Text
+                                 }
+                  deriving (Show)
 
-$(deriveJSON defaultOptions { constructorTagModifier = underscore } ''GithubResponse)
+data EmailResponse = EmailResponse { email :: Text
+                                   , verified :: Bool
+                                   , primary :: Bool
+                                   }
+                   deriving (Show)
+
+-- Derive JSON encoding-decoding for data structures
+$(deriveJSON defaultOptions { fieldLabelModifier = underscore } ''AuthResponse)
+$(deriveJSON defaultOptions { fieldLabelModifier = underscore } ''EmailResponse)
 
 mkYesod "Project" [parseRoutes|
                    / HomeR GET
@@ -41,12 +48,14 @@ mkYesod "Project" [parseRoutes|
 
 getHomeR :: Handler Html
 getHomeR = do
+  let scopes = T.intercalate "," [ "user" ]
   -- Get app environment into scope.
   Project { .. } <- getYesod
   -- Get request info.
   req <- getRequest
   -- Send our user to GitHub.
-  redirect ([qc|https://github.com/login/oauth/authorize?client_id={clientId}&redirect_uri={url}/private&state={fromJust $ reqToken req}|] :: Text)
+  redirect
+    ([qc|https://github.com/login/oauth/authorize?client_id={clientId}&redirect_uri={url}/private&scope={scopes}&state={fromJust $ reqToken req}|] :: Text)
 
 getPrivateR :: Handler Html
 getPrivateR = do
@@ -61,17 +70,26 @@ getPrivateR = do
   -- Check state
   when (state /= fromJust (reqToken req)) $ fail "Invalid state; please don't try to hack us!"
   -- Call Github back
-  r <- liftIO $ postWith (defaults & header "Accept" .~ ["application/json"])
-       "https://github.com/login/oauth/access_token"
-       [ "client_id" := clientId
-       , "client_secret" := clientSecret
-       , "code" := code
-       , "redirect_uri" := url <> "/private"
-       ]
-  a@GithubResponse { .. } <- maybe (fail "Invalid response from GitHub") return $ decode $ r ^. responseBody
-  defaultLayout [whamlet| Response: #{show a}
-                        |]
+  auth' <- liftIO $ postWith (defaults & header "Accept" .~ ["application/json"])
+           "https://github.com/login/oauth/access_token"
+           [ "client_id" := clientId
+           , "client_secret" := clientSecret
+           , "code" := code
+           , "redirect_uri" := url <> "/private"
+           ]
+  -- Decode JSON and scopes
+  auth@AuthResponse { accessToken } <- maybe (fail "Invalid auth response") return $ decode $ auth' ^. responseBody
+  let scopes = T.splitOn "," $ scope auth
+  -- Check access rights
+  unless ("user" `elem` scopes) $ fail "Unsufficient access rights"
+  -- Get user emails
+  mails' <- liftIO $ getWith (defaults & param "access_token" .~ [accessToken])
+            "https://api.github.com/user/emails"
+  (mails :: [EmailResponse]) <- maybe (fail "Invalid emails response") return $ decode $ mails' ^. responseBody
+  -- Show them
+  defaultLayout [whamlet| Your emails: #{show mails} |]
 
+main :: IO ()
 main = do
   clientId <- T.pack <$> getEnv "CLIENT_ID"
   clientSecret <- T.pack <$> getEnv "CLIENT_SECRET"
